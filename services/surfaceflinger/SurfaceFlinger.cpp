@@ -157,6 +157,13 @@ class ClientInterface;
 
 composer::ComposerExtnLib composer::ComposerExtnLib::g_composer_ext_lib_;
 
+#ifdef PHASE_OFFSET_EXTN
+struct ComposerExtnIntf {
+    composer::PhaseOffsetExtnIntf *phaseOffsetExtnIntf = nullptr;
+};
+struct ComposerExtnIntf g_comp_ext_intf_;
+#endif
+
 namespace android {
 
 using namespace std::string_literals;
@@ -540,6 +547,14 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
         (!strncmp(property, "1", PROPERTY_VALUE_MAX ) ||
         (!strncasecmp(property,"true", PROPERTY_VALUE_MAX )))) {
         mVsyncSourceReliableOnDoze = true;
+    }
+
+    // If mPluggableVsyncPrioritized is true then the order of priority of V-syncs is Pluggable
+    // followed by Primary and Secondary built-ins.
+    if((property_get("vendor.display.pluggable_vsync_prioritized", property, "0") > 0) &&
+        (!strncmp(property, "1", PROPERTY_VALUE_MAX ) ||
+        (!strncasecmp(property,"true", PROPERTY_VALUE_MAX )))) {
+        mPluggableVsyncPrioritized = true;
     }
 
     // We should be reading 'persist.sys.sf.color_saturation' here
@@ -973,6 +988,8 @@ void SurfaceFlinger::init() {
         if (ret) {
             ALOGI("Unable to create display extension");
         }
+
+        createPhaseOffsetExtn();
     }
     ALOGV("Done initializing");
 }
@@ -1814,7 +1831,13 @@ void SurfaceFlinger::signalRefresh() {
 }
 
 nsecs_t SurfaceFlinger::getVsyncPeriod() const {
-    const auto displayId = getInternalDisplayIdLocked();
+    auto displayId = getInternalDisplayIdLocked();
+    if (mNextVsyncSource) {
+        displayId = mNextVsyncSource->getId();
+    } else if (mActiveVsyncSource) {
+        displayId = mActiveVsyncSource->getId();
+    }
+
     if (!displayId || !getHwComposer().isConnected(*displayId)) {
         return 0;
     }
@@ -1910,6 +1933,15 @@ void SurfaceFlinger::onHotplugReceived(int32_t sequenceId, hal::HWDisplayId hwcD
 
     mPendingHotplugEvents.emplace_back(HotplugEvent{hwcDisplayId, connection});
 
+    if (connection != hal::Connection::CONNECTED) {
+        const std::optional<DisplayIdentificationInfo> info =
+           getHwComposer().onHotplug(hwcDisplayId, connection);
+        if (info) {
+            mDisplaysList.remove(getDisplayDeviceLocked(mPhysicalDisplayTokens[info->id]));
+        }
+        mNextVsyncSource = getVsyncSource();
+    }
+
     if (std::this_thread::get_id() == mMainThreadId) {
         // Process all pending hot plug events immediately if we are on the main thread.
         processDisplayHotplugEventsLocked();
@@ -1939,6 +1971,18 @@ void SurfaceFlinger::onRefreshReceived(int sequenceId, hal::HWDisplayId /*hwcDis
         return;
     }
     repaintEverythingForHWC();
+
+    if (mDisplaysList.size() != 1) {
+        // Revisit this for multi displays.
+        return;
+    }
+
+    {
+        // Track Vsync Period before and after refresh.
+        std::lock_guard lock(mVsyncPeriodMutex);
+        mVsyncPeriods = {};
+        mVsyncPeriods.push_back(getVsyncPeriod());
+    }
 }
 
 void SurfaceFlinger::setVsyncEnabled(bool enabled) {
@@ -2592,9 +2636,13 @@ void SurfaceFlinger::postComposition()
 
     getBE().mDisplayTimeline.updateSignalTimes();
     mPreviousPresentFences[1] = mPreviousPresentFences[0];
-    mPreviousPresentFences[0] = mActiveVsyncSource
-            ? getHwComposer().getPresentFence(*mActiveVsyncSource->getId())
-            : Fence::NO_FENCE;
+
+    sp<DisplayDevice> vSyncSource = mNextVsyncSource;
+    if (mNextVsyncSource == NULL) {
+        vSyncSource = mActiveVsyncSource;
+    }
+    mPreviousPresentFences[0] = vSyncSource ?
+        getHwComposer().getPresentFence(*vSyncSource->getId()) : Fence::NO_FENCE;
     auto presentFenceTime = std::make_shared<FenceTime>(mPreviousPresentFences[0]);
     getBE().mDisplayTimeline.push(presentFenceTime);
 
@@ -2627,6 +2675,8 @@ void SurfaceFlinger::postComposition()
         presentFenceTime->isValid()) {
         mScheduler->addPresentFence(presentFenceTime);
     }
+
+    forceResyncModel();
 
     const bool isDisplayConnected = display && getHwComposer().isConnected(*display->getId());
 
@@ -2767,6 +2817,30 @@ FloatRect SurfaceFlinger::getLayerClipBoundsForDisplay(const DisplayDevice& disp
     return displayDevice.getViewport().toFloatRect();
 }
 
+void SurfaceFlinger::forceResyncModel() NO_THREAD_SAFETY_ANALYSIS {
+    std::lock_guard lock(mVsyncPeriodMutex);
+    if (!mVsyncPeriods.size()) {
+        return;
+    }
+
+    const nsecs_t period = getVsyncPeriod();
+    // Model resync should happen at every fps change.
+    // Upon increase/decrease in vsync period start resync immediately.
+    // Initial set of vsync wakeups happen at ref_time + N * period where N = 1, 2, 3 ..
+    // Since if doesnt make use of timestamp to compute period, resync can be triggered
+    // as soon as change is fps(period) is observed.
+    if (period > mVsyncPeriods.at(mVsyncPeriods.size() - 1)) {
+        ATRACE_CALL();
+        mScheduler->resyncToHardwareVsync(true, period, true /* force resync */);
+        mVsyncPeriods.push_back(period);
+    } else if (period < mVsyncPeriods.at(mVsyncPeriods.size() - 1)) {
+        // Vsync period changed. Trigger resync.
+        ATRACE_CALL();
+        mScheduler->resyncToHardwareVsync(true, period, true /* force resync */);
+        mVsyncPeriods = {};
+    }
+}
+
 void SurfaceFlinger::computeLayerBounds() {
     for (const auto& pair : ON_MAIN_THREAD(mDisplays)) {
         const auto& displayDevice = pair.second;
@@ -2784,10 +2858,12 @@ void SurfaceFlinger::computeLayerBounds() {
 }
 
 sp<DisplayDevice> SurfaceFlinger::getVsyncSource() {
-    // Return the vsync source from the active displays based on
-    // the order in which they are connected. Normally the order
-    // of priority is Primary (Built-in/Pluggable) followed by
-    // Secondary built-ins followed by pluggable.
+    // Return the vsync source from the active displays based on the order in which they are
+    // connected.
+    // Normally the order of priority is Primary (Built-in/Pluggable) followed by Secondary
+    // built-ins followed by Pluggable. But if mPluggableVsyncPrioritized is true then the
+    // order of priority is Pluggables followed by Primary and Secondary built-ins.
+
     for (const auto& display : mDisplaysList) {
         hal::PowerMode mode = display->getPowerMode();
         if (display->isVirtual() || (mode == hal::PowerMode::OFF) ||
@@ -2841,6 +2917,7 @@ void SurfaceFlinger::updateVsyncSource()
     } else if ((mNextVsyncSource != NULL) &&
         (mActiveVsyncSource != NULL)) {
         // Switch vsync to the new source
+        mScheduler->disableHardwareVsync(true);
         mScheduler->resyncToHardwareVsync(true, getVsyncPeriod());
     }
 }
@@ -2932,9 +3009,8 @@ void SurfaceFlinger::processDisplayHotplugEventsLocked() {
                 mInterceptor->saveDisplayDeletion(state.sequenceId);
                 mCurrentState.displays.removeItemsAt(index);
             }
-            mDisplaysList.remove(getDisplayDeviceLocked(it->second));
-            updateVsyncSource();
             mPhysicalDisplayTokens.erase(it);
+            updateVsyncSource();
             if (mInternalPresentationDisplays && isInternalDisplay) {
                 // Update mInternalPresentationDisplays flag
                 updateInternalDisplaysPresentationMode();
@@ -3144,7 +3220,20 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
     }
 #endif
     if (!state.isVirtual()) {
-        mDisplaysList.push_back(getDisplayDeviceLocked(displayToken));
+        sp<DisplayDevice> display = getDisplayDeviceLocked(displayToken);
+        if (mPluggableVsyncPrioritized && !isInternalDisplay(display)) {
+            // Insert the pluggable display just before the first built-in display
+            // so that the earlier pluggable display remains the V-sync source.
+            auto it = mDisplaysList.begin();
+            for (; it != mDisplaysList.end(); it++ ) {
+                if(isInternalDisplay(*it)) {
+                    break;
+                }
+            }
+            mDisplaysList.insert(it, display);
+        } else {
+            mDisplaysList.push_back(display);
+        }
         LOG_FATAL_IF(!displayId);
         dispatchDisplayHotplugEvent(displayId->value, true);
 
@@ -4804,7 +4893,8 @@ void SurfaceFlinger::setPowerModeInternal(const sp<DisplayDevice>& display, hal:
                 mScheduler->onScreenAcquired(mAppConnectionHandle);
                 mScheduler->resyncToHardwareVsync(true, getVsyncPeriod());
             }
-        } else {
+        } else if ((mPluggableVsyncPrioritized && (displayId != getInternalDisplayIdLocked())) ||
+                    displayId == getInternalDisplayIdLocked()) {
             updateVsyncSource();
         }
 
@@ -7186,6 +7276,27 @@ void SurfaceFlinger::setupEarlyWakeUpFeature() {
         mEarlyWakeUpEnabled = true;
     }
     ALOGI("Early Wakeup Feature enabled: %d", mEarlyWakeUpEnabled);
+#endif
+}
+
+void SurfaceFlinger::createPhaseOffsetExtn() {
+#ifdef PHASE_OFFSET_EXTN
+    if (mUseAdvanceSfOffset) {
+        int ret = mComposerExtnIntf->CreatePhaseOffsetExtn(&g_comp_ext_intf_.phaseOffsetExtnIntf);
+        if (ret) {
+            ALOGI("Unable to create PhaseOffset extension");
+            return;
+        }
+
+        // Get the Advanced SF Offsets from Phase Offset Extn
+        std::unordered_map<float, int64_t> advancedSfOffsets;
+        g_comp_ext_intf_.phaseOffsetExtnIntf->GetAdvancedSfOffsets(&advancedSfOffsets);
+
+        // Update the Advanced SF Offsets
+        std::lock_guard<std::mutex> lock(mActiveConfigLock);
+        mPhaseConfiguration->UpdateSfOffsets(advancedSfOffsets);
+        mVSyncModulator->setPhaseOffsets(mPhaseConfiguration->getCurrentOffsets());
+    }
 #endif
 }
 
